@@ -1,0 +1,212 @@
+name: 🛠️ Build and Publish OpenCV SDKs
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag'
+        required: true
+        type: string
+  push: 
+    tags:
+     - '*'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ------------------------
+          # --- ANDROID PROFILES ---
+          # ------------------------
+          - platform: android
+            os: ubuntu-latest
+            ndk_version: "r25c"
+            shared: "OFF"
+            samples: "OFF"
+            opencl: "ON"
+            opengl: "OFF"
+            vulkan: "OFF"
+            tbb: "OFF"
+            openmp: "OFF"
+            cuda: "OFF"
+            artifact_name: opencv-android
+
+          # ----------------------
+          # --- LINUX PROFILES ---
+          # ----------------------
+          - platform: linux
+            os: ubuntu-latest
+            shared: "OFF"
+            samples: "OFF"
+            opencl: "OFF"
+            opengl: "OFF"
+            vulkan: "OFF"
+            tbb: "OFF"
+            openmp: "OFF"
+            cuda: "OFF"
+            artifact_name: opencv-linux-static
+
+          - platform: linux
+            os: ubuntu-latest
+            shared: "ON"
+            samples: "OFF"
+            opencl: "ON"
+            opengl: "ON"
+            vulkan: "ON"
+            tbb: "ON"
+            openmp: "OFF"
+            cuda: "OFF"
+            artifact_name: opencv-linux-shared-tbb
+
+          - platform: linux
+            os: ubuntu-latest
+            shared: "ON"
+            samples: "OFF"
+            opencl: "ON"
+            opengl: "ON"
+            vulkan: "ON"
+            tbb: "OFF"
+            openmp: "ON"
+            cuda: "OFF"
+            artifact_name: opencv-linux-shared-openmp
+
+          - platform: linux
+            os: ubuntu-latest
+            shared: "OFF"
+            samples: "OFF"
+            opencl: "ON"
+            opengl: "ON"
+            vulkan: "ON"
+            tbb: "ON"
+            openmp: "OFF"
+            cuda: "OFF"
+            artifact_name: opencv-linux-static-tbb
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout self
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up JDK 17
+        if: matrix.platform == 'android'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Android SDK
+        if: matrix.platform == 'android'
+        uses: android-actions/setup-android@v3
+      
+      - name: Setup Android NDK
+        if: matrix.platform == 'android'
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          # Change this version to match your Godot/GDExtension target exactly (e.g., r25c, r26b)
+          ndk-version: ${{ matrix.ndk_version }} 
+          link-to-sdk: true
+
+      - name: Install Ninja Build Engine
+        if: matrix.platform == 'android'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Build Android SDK
+        if: matrix.platform == 'android'
+        shell: bash
+        run: |
+          # Create standalone workspace folders
+          mkdir -p ${{ github.workspace }}/build_android
+          mkdir -p ${{ github.workspace }}/export_${{ matrix.artifact_name }}
+          
+          ANDROID_ARGS=()
+          
+          if [ "${{ matrix.opencl }}" = "ON" ]; then
+            ANDROID_ARGS+=("--opencl")
+          fi
+          if [ "${{ matrix.samples }}" = "OFF" ]; then
+            ANDROID_ARGS+=("--no_samples_build")
+          fi
+
+          # Run the official python orchestrator
+          python3 opencv/platforms/android/build_sdk.py \
+            --sdk_path="$ANDROID_HOME" \
+            --ndk_path="$ANDROID_NDK_HOME" \
+            --extra_modules_path="${{ github.workspace }}/opencv_contrib/modules" \
+            --disable IPP \
+            "${ANDROID_ARGS[@]}" \
+            ${{ github.workspace }}/build_android \
+            ${{ github.workspace }}/opencv
+            
+          # The script compiles everything and generates an 'OpenCV-android-sdk' folder.
+          # We copy its contents directly into our target export directory.
+          cp -r ${{ github.workspace }}/build_android/OpenCV-android-sdk/* ${{ github.workspace }}/export_${{ matrix.artifact_name }}/
+
+      # ==========================================
+      # 🖥️ TRACK B: DESKTOP COMPILATION (Standard CMake)
+      # ==========================================
+      - name: Run CMake Configuration and Build (Desktop Platforms)
+        if: matrix.platform != 'android'
+        shell: bash
+        env:
+          CXXFLAGS: "-include cstdint"
+        run: |
+          mkdir build && cd build
+          
+          CMAKE_ARGS=(
+            "-DOPENCV_EXTRA_MODULES_PATH=${{ github.workspace }}/opencv_contrib/modules"
+            "-DBUILD_SHARED_LIBS=${{ matrix.shared }}"
+            "-DBUILD_EXAMPLES=${{ matrix.samples }}"
+            "-DWITH_CUDA=${{ matrix.cuda }}"
+            "-DWITH_VULKAN=${{ matrix.vulkan }}"
+            "-DWITH_OPENGL=${{ matrix.opengl }}"
+            "-DWITH_TBB=${{ matrix.tbb }}"
+            "-DWITH_OPENMP=${{ matrix.openmp }}"
+            "-DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/export_${{ matrix.artifact_name }}"
+            "-DCMAKE_BUILD_TYPE=Release"
+          )
+          
+          cmake ../opencv "${CMAKE_ARGS[@]}"
+          cmake --build . --target install --config Release -j $(nproc || echo 4)
+
+      - name: Compress Bundle
+        shell: bash
+        run: tar -czf ${{ matrix.artifact_name }}.tar.gz -C ${{ github.workspace }}/export_${{ matrix.artifact_name }} .
+
+      - name: Upload Intermediary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download All Matrix Compressed Bundles
+        uses: actions/download-artifact@v4
+        with:
+          path: deliverables
+
+      - name: Create GitHub Release and Upload Artifacts
+        uses: softprops/action-gh-release@v2
+        if: github.ref_type != 'tag'
+        with:
+          tag_name: ${{ github.event.inputs.tag_name }}
+          name: OpenCV Custom SDK - v${{ github.event.inputs.tag_name }}
+          body: |
+            Automated multi-platform compilation matrix for GDExtension integration.
+            Built version matching upstream OpenCV / Contrib: ${{ github.event.inputs.tag_name }}
+          files: deliverables/**/*.tar.gz
+      - name: Create GitHub Release and Upload Artifacts
+        uses: softprops/action-gh-release@v2
+        if: github.ref_type == 'tag'
+        with:
+          name: OpenCV Custom SDK - v${{ github.ref_name }}
+          body: |
+            Automated multi-platform compilation matrix for GDExtension integration.
+            Built version matching upstream OpenCV / Contrib: ${{ github.ref_name }}
+          files: deliverables/**/*.tar.gz
